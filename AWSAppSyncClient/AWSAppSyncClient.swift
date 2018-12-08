@@ -65,22 +65,26 @@ class SnapshotProcessController {
             watchers.onNetworkAvailabilityStatusChanged(isEndpointReachable: isReachable)
         }
     }
-    
-    func shouldExecuteOperation(operation: AWSAppSyncGraphQLOperation) -> Bool {
+
+    var isNetworkReachable: Bool {
+        guard let reachability = reachability else {
+            return false
+        }
+
+        switch reachability.connection {
+        case .none:
+            return false
+        case .wifi:
+            return true
+        case .cellular:
+            return allowsCellularAccess
+        }
+    }
+
+    func canExecute(_ operation: AWSAppSyncGraphQLOperation) -> Bool {
         switch operation {
         case .mutation:
-            guard let reachability = reachability else {
-                return false
-            }
-
-            switch reachability.connection {
-            case .none:
-                return false
-            case .wifi:
-                return true
-            case .cellular:
-                return allowsCellularAccess
-            }
+            return isNetworkReachable
         case .query:
             return true
         case .subscription:
@@ -712,18 +716,18 @@ class AWSAppSyncNetworkStatusChangeNotifier {
 public class AWSAppSyncClient {
     
     public let apolloClient: ApolloClient?
-    public var offlineMutationDelegate: AWSAppSyncOfflineMutationDelegate?
     public let store: ApolloStore?
     public let presignedURLClient: AWSS3ObjectPresignedURLGenerator?
     public let s3ObjectManager: AWSS3ObjectManager?
-    
+
+    public var offlineMutationDelegate: AWSAppSyncOfflineMutationDelegate?
+    private var mutationQueue: AWSPerformMutationQueue!
+
     var reachability: Reachability?
     
     private var networkStatusWatchers: [NetworkConnectionNotification] = []
     private var appSyncConfiguration: AWSAppSyncClientConfiguration
     internal var httpTransport: AWSNetworkTransport?
-    private var offlineMuationCacheClient: AWSAppSyncOfflineMutationCache?
-    private var offlineMutationExecutor: MutationExecutor?
     private var autoSubmitOfflineMutations: Bool = false
     private var appSyncMQTTClient = AppSyncMQTTClient()
     private var subscriptionsQueue = DispatchQueue(label: "SubscriptionsQueue", qos: .userInitiated)
@@ -751,27 +755,23 @@ public class AWSAppSyncClient {
         self.connectionStateChangeHandler = appSyncConfiguration.connectionStateChangeHandler
         
         self.apolloClient = ApolloClient(networkTransport: self.httpTransport!, store: self.appSyncConfiguration.store)
+
+        let snapshotProcessController = SnapshotProcessController(endpointURL: self.appSyncConfiguration.url)
         
-        try self.offlineMuationCacheClient = AWSAppSyncOfflineMutationCache()
-        if let fileURL = self.appSyncConfiguration.databaseURL {
-            do {
-                self.offlineMuationCacheClient = try AWSAppSyncOfflineMutationCache(fileURL: fileURL)
-            } catch {
-                // continue using in memory cache client
-            }
-        }
-        
-        self.offlineMutationExecutor = MutationExecutor(
-            networkClient: self.httpTransport!,
+        self.mutationQueue = AWSPerformMutationQueue(
             appSyncClient: self,
-            snapshotProcessController: SnapshotProcessController(endpointURL: self.appSyncConfiguration.url),
-            fileURL: self.appSyncConfiguration.databaseURL)
-        networkStatusWatchers.append(self.offlineMutationExecutor!)
-        
+            networkClient: httpTransport!,
+            handlerQueue: .main,
+            snapshotProcessController: snapshotProcessController,
+            fileURL: appSyncConfiguration.databaseURL)
+        networkStatusWatchers.append(mutationQueue)
+
         if AWSAppSyncNetworkStatusChangeNotifier.sharedInstance == nil {
-            AWSAppSyncNetworkStatusChangeNotifier.setupSharedInstance(host: self.appSyncConfiguration.url.host!, allowsCellular: self.appSyncConfiguration.allowsCellularAccess)
+            AWSAppSyncNetworkStatusChangeNotifier.setupSharedInstance(
+                host: self.appSyncConfiguration.url.host!,
+                allowsCellular: self.appSyncConfiguration.allowsCellularAccess)
         }
-        
+
         NotificationCenter.default.addObserver(
             self, selector: #selector(appsyncReachabilityChanged(note:)), name: .appSyncReachabilityChanged, object: nil)
     }
@@ -861,45 +861,28 @@ public class AWSAppSyncClient {
     ///   - result: The result of the performed mutation, or `nil` if an error occurred.
     ///   - error: An error that indicates why the mutation failed, or `nil` if the mutation was succesful.
     /// - Returns: An object that can be used to cancel an in progress mutation.
-    @discardableResult public func perform<Mutation: GraphQLMutation>(mutation: Mutation,
-                                                                      queue: DispatchQueue = DispatchQueue.main,
-                                                                      optimisticUpdate: OptimisticResponseBlock? = nil,
-                                                                      conflictResolutionBlock: MutationConflictHandler<Mutation>? = nil,
-                                                                      resultHandler: OperationResultHandler<Mutation>? = nil) -> PerformMutationOperation<Mutation>? {
+    @discardableResult
+    public func perform<Mutation: GraphQLMutation>(
+        mutation: Mutation,
+        queue: DispatchQueue = .main,
+        optimisticUpdate: OptimisticResponseBlock? = nil,
+        conflictResolutionBlock: MutationConflictHandler<Mutation>? = nil,
+        resultHandler: OperationResultHandler<Mutation>? = nil) -> Cancellable {
+
         if let optimisticUpdate = optimisticUpdate {
             do {
-                _ = try self.store?.withinReadWriteTransaction { transaction in
+                _ = try store?.withinReadWriteTransaction { transaction in
                     optimisticUpdate(transaction)
                 }.await()
             } catch {
+                debugPrint("optimisticUpdate error: \(error)")
             }
         }
-        
-        let taskCompletionSource = AWSTaskCompletionSource<Mutation>()
-        taskCompletionSource.task.continueWith(block: { (task) -> Any? in
-            _ = task.result
-            return nil
-        })
-        
-        let serializationFormat = JSONSerializationFormat.self
-        let bodyRequest = requestBody(for: mutation)
-        let data = try! serializationFormat.serialize(value: bodyRequest)
-        let record = AWSAppSyncMutationRecord()
-        if let s3Object = self.checkAndFetchS3Object(variables: mutation.variables) {
-            record.type = .graphQLMutationWithS3Object
-            record.s3ObjectInput =  InternalS3ObjectDetails(bucket: s3Object.bucket,
-                                                            key: s3Object.key,
-                                                            region: s3Object.region,
-                                                            contentType: s3Object.contentType,
-                                                            localUri: s3Object.localUri)
-        }
-        record.data = data
-        record.contentMap = mutation.variables
-        record.jsonRecord = mutation.variables?.jsonObject
-        record.recordState = .inQueue
-        record.operationString = Mutation.operationString
-        
-        return PerformMutationOperation(offlineMutationRecord: record, client: self.apolloClient!, appSyncClient: self, offlineExecutor: self.offlineMutationExecutor!, mutation: mutation, handlerQueue: queue, mutationConflictHandler: conflictResolutionBlock, resultHandler: resultHandler)
+
+        return mutationQueue.add(
+            mutation,
+            mutationConflictHandler: conflictResolutionBlock,
+            mutationResultHandler: resultHandler)
     }
     
     internal final class EmptySubscription: GraphQLSubscription {
@@ -1012,65 +995,5 @@ public class AWSAppSyncClient {
             subscriptionMetadataCache: self.subscriptionMetadataCache,
             syncConfiguration: syncConfiguration,
             handlerQueue: callbackQueue) as Cancellable
-    }
-    
-    private func checkAndFetchS3Object(variables: GraphQLMap?) -> (bucket: String, key: String, region: String, contentType: String, localUri: String)? {
-        if let variables = variables {
-            for key in variables.keys {
-                if let object = variables[key].jsonValue as? [String: String] {
-                    guard let bucket = object["bucket"] else { return nil }
-                    guard let key = object["key"] else { return nil }
-                    guard let region = object["region"] else { return nil }
-                    guard let contentType = object["mimeType"] else { return nil }
-                    guard let localUri = object["localUri"] else { return nil }
-                    return (bucket, key, region, contentType, localUri)
-                }
-            }
-        }
-        return nil
-    }
-    
-    private func requestBody<Operation: GraphQLOperation>(for operation: Operation) -> GraphQLMap {
-        return ["query": type(of: operation).requestString, "variables": operation.variables]
-    }
-}
-
-protocol InMemoryMutationDelegate: class {
-    func performMutation(dispatchGroup: DispatchGroup)
-}
-
-public final class PerformMutationOperation<Mutation: GraphQLMutation>: InMemoryMutationDelegate {
-    let client: ApolloClient
-    let appSyncClient: AWSAppSyncClient
-    let mutation: Mutation
-    let handlerQueue: DispatchQueue
-    let mutationConflictHandler: MutationConflictHandler<Mutation>?
-    let resultHandler: OperationResultHandler<Mutation>?
-    let mutationExecutor: MutationExecutor
-    public let mutationRecord: AWSAppSyncMutationRecord
-    
-    init(offlineMutationRecord: AWSAppSyncMutationRecord, client: ApolloClient, appSyncClient: AWSAppSyncClient, offlineExecutor: MutationExecutor, mutation: Mutation, handlerQueue: DispatchQueue, mutationConflictHandler: MutationConflictHandler<Mutation>?, resultHandler: OperationResultHandler<Mutation>?) {
-        self.mutationRecord = offlineMutationRecord
-        self.client = client
-        self.appSyncClient = appSyncClient
-        self.mutationExecutor = offlineExecutor
-        self.mutation = mutation
-        self.handlerQueue = handlerQueue
-        self.resultHandler = resultHandler
-        self.mutationConflictHandler = mutationConflictHandler
-        // set the deletgate callback to self
-        self.mutationRecord.inmemoryExecutor = self
-        mutationExecutor.queueMutation(mutation: self.mutationRecord)
-    }
-    
-    func performMutation(dispatchGroup: DispatchGroup) {
-        dispatchGroup.enter()
-        if self.mutationRecord.type == .graphQLMutationWithS3Object {
-            // call s3mutation object here
-            _ = appSyncClient.performMutationWithS3Object(operation: self.mutation, s3Object: self.mutationRecord.s3ObjectInput!, conflictResolutionBlock: mutationConflictHandler, dispatchGroup: dispatchGroup, handlerQueue: handlerQueue, resultHandler: resultHandler)
-        } else {
-            _ = appSyncClient.send(operation: self.mutation, context: nil, conflictResolutionBlock: self.mutationConflictHandler, dispatchGroup: dispatchGroup, handlerQueue: self.handlerQueue, resultHandler: self.resultHandler)
-            _ = dispatchGroup.wait(timeout: DispatchTime(uptimeNanoseconds: 3000000))
-        }
     }
 }
